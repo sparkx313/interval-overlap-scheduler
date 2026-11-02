@@ -1,0 +1,340 @@
+interval-overlap-scheduler benchmarks - python 3.11.9
+measures per-query conflict cost and first_free cost as the table
+grows 100 -> 100000, plus write cost vs depth, bytes per interval,
+result agreement across the three structures and a density sweep.
+
+==============================================================================
+1) comparisons per overlaps query vs table size (deterministic)
+==============================================================================
+the axis grows with the table (span = n * gap), so the load density
+is held fixed and only the number of stored intervals grows.
+       n     q  mean_k  naive/cq  sweep/cq   tree/cq  sweep_nav naive/tree
+------- ----- ------- --------- --------- --------- ---------- ----------
+     100   200    0.59     100.0       0.6       7.7        6.8     12.96x
+    1000   200    0.56    1000.0       0.6      11.6       10.0     86.51x
+    5000   200    0.52    5000.0       0.5      15.1       12.4    330.58x
+   20000    40    0.53   20000.0       0.5      17.6       14.3   1136.36x
+  100000    40    0.62  100000.0       0.6      21.1       16.7   4733.73x
+
+Interpretation: naive tests 100.0 intervals per query at n=100 and 100000.0 at
+  n=100000, i.e. 1000x more work for a 1000x larger table - the scan cost
+  equals n by construction, so this is the linear baseline, not a surprise.
+
+Interpretation: over the same 1000x growth the tree goes 7.7 -> 21.1 tests per
+  query (2.7x) and the sweep, here to two decimals so the endpoints do not
+  both round away, 0.59 -> 0.62 (1.1x); the table's sweep column is one-
+  decimal, which is why its endpoints look flat there while the unrounded
+  ratio is still 1.1x. mean result size is 0.59 -> 0.62, so the growth
+  measured here is table size, not output size.
+
+Interpretation: the tree's measured edge is 4733.73x at n=100000 and still
+  12.96x at n=100; the sweep needs only 0.6 probes at n=100000 but 16.7
+  binary-search comparisons to locate its cut point, so its work is nav-
+  dominated while the tree's is probe-dominated.
+
+Interpretation: stated plainly, that makes the sweep beat the tree on probe
+  count alone at every size in this table (0.6 against 21.1 at n=100000):
+  stored lengths are uniform here, so the prefix-max cut lands almost
+  immediately. only the wall clock in 1b can decide between them.
+==============================================================================
+1b) wall clock per overlaps query (timing)
+==============================================================================
+best of 5 passes after 2 discarded warm-ups; the band column gives
+each structure's own worst-best spread for that pass, us per query.
+a pairwise verdict uses the wider of the two bands it compares, never
+the widest number in the row.
+      n q/pass naive us/q sweep us/q  tree us/q      band n/s/t naive/tree
+------ ------ ---------- ---------- ---------- --------------- ----------
+   1000    250      157.0        3.0        3.4    13.0/0.2/2.1      46.4x
+  10000     25     1921.4        3.9        4.9   559.2/0.2/1.1     393.1x
+ 100000     20    18329.3        4.5        6.2  8069.3/0.4/0.1    2942.1x
+
+Interpretation: at n=100000 one conflicts query is naive 18329.3 us, sweep 4.5
+  us, tree 6.2 us: a 2942x gap. the wider of the naive and tree bands at that
+  size is 8069.3 us, so the gap is 2x its own floor and is not noise.
+
+Interpretation: at n=1000 the same structures cost 157.0 / 3.0 / 3.4 us; the
+  naive band there is 13.0 us and the tree's 2.1 us, so the naive-tree gap of
+  153.7 us is 11.8x the pair floor, above the n=100000 row's 2x. both clear
+  their own floors, so neither is called a tie; which of the two is the
+  stronger evidence this run is set by their bands, not by the size of the
+  table.
+
+Interpretation: sweep against tree on the clock, judged pair by pair against
+  the wider of their own two bands: the sweep is measurably cheaper at
+  n=100000, the tree at no size, and the two are inside noise at n=1000,
+  n=10000. the largest sweep-tree gap in this section is 1.8 us per query (at
+  n=100000), against a naive-tree gap of 18323.1 us at the same size - the
+  sweep wins 1 of the 3 sizes and the tree 0, by at most 1.8 us per query - a
+  real margin, but small next to the naive gap, so what actually separates the
+  two indexed structures is still the write cost in section 4.
+==============================================================================
+2) comparisons per first_free call on a busy table (deterministic)
+==============================================================================
+table occupancy is 60% (length 120 / gap 200) and each request
+is 50 wide, so a free slot usually requires hopping past bookings;
+each hop is a fresh search. that is why first_free is the worst
+query for an index built to answer one search at a time.
+       n  cases hops/call naive/call sweep/call tree/call naive/tree
+------- ------ --------- ---------- ---------- --------- ----------
+     100    120      1.99      199.2        1.4      15.1     13.20x
+    1000    120      2.01     2008.3        1.5      23.0     87.19x
+    5000    120      1.90     9500.0        1.2      29.1    326.93x
+   20000     20      1.85    37000.0        0.9      31.4   1178.34x
+  100000     20      2.20   220000.0        1.4      48.0   4583.33x
+
+Interpretation: one booking attempt performs 1.99 searches per call at n=100
+  and 2.20 at n=100000, so its cost is hops x per-search, not one search; 100%
+  of the requests are satisfiable at n=100 and 100% at n=100000.
+
+Interpretation: per call naive rises 199.2 -> 220000.0 tests (1105x) while the
+  tree rises 15.1 -> 48.0 (3.2x), so the tree's lead here is 4583.33x against
+  4733.73x for a plain overlaps query on the same table size (section 1): the
+  hop loop spends part of the index's advantage.
+
+Interpretation: the sorted list is the cheapest of the three here: 1.4 tests
+  per call against 48.0 for the tree and 220000.0 for naive, i.e. 0.03x the
+  tree's work. its probe count is small because one prefix-max cut removes the
+  tail; what it cannot avoid is paying for that array on every write, which is
+  section 4.
+==============================================================================
+2b) wall clock per first_free call (timing)
+==============================================================================
+       n cases/pass   naive us   sweep us    tree us     band n/s/t naive/tree
+------- ---------- ---------- ---------- ---------- -------------- ----------
+    1000         60      324.8        6.7        7.9   27.0/0.4/1.3      40.9x
+   10000         20     2826.5        7.2        8.7  202.8/0.3/0.3     323.0x
+   50000         20    16566.0        7.4        9.6 1733.8/0.5/1.0    1725.6x
+
+Interpretation: one booking attempt at n=50000 costs naive 16566.0 us, sweep
+  7.4 us, tree 9.6 us; the wider of the naive and tree bands at that size is
+  1733.8 us, so the naive-tree gap of 16556.4 us clears its own floor by 9.5x.
+
+Interpretation: wall clock on the same n=1000 table: a single overlaps query
+  is 46.4x naive over tree, one first_free call 40.9x, so the hop loop spends
+  11.8% of the index's measured lead at that size. section 2 makes the same
+  comparison on probes at n=100000 (4583.33x against 4733.73x), where it
+  spends only 3.2% - the two agree on direction and disagree on extent, and
+  this run cannot separate the extra search from the per-call overhead each
+  hop drags along (a result list to build, a sort, a Python call).
+
+Interpretation: absolute cost is the honest headline: 9.6 us per attempt on
+  the tree means a UI could run it about 104167 times per second on this
+  machine.
+==============================================================================
+3) all three structures must agree, exactly (deterministic)
+==============================================================================
+a disagreement is any query where the three result lists differ in
+content OR order. expected value 0; reported plainly below.
+               dataset  queries  stored  disagree  items out  tree out
+--------------------- -------- ------- --------- ---------- ---------
+    sparse n=3000 half      500    3000         0        296       296
+    sparse n=3000 incl      500    3000         0        296       296
+     dense n=3000 half      500    3000         0        627       627
+     dense n=3000 incl      500    3000         0        627       627
+     sparse n=400 half      500     400         0        281       281
+     sparse n=400 incl      500     400         0        281       281
+
+boundary cases: conflict counts per structure
+                          case   open   incl  naive  sweep   tree agree
+----------------------------- ------ ------ ------ ------ ------ -----
+    touching [0,10) vs [10,20)      0      1      0      0      0   yes
+     zero-length query [10,10)      0      2      0      0      0   yes
+      zero-length stored [5,5)      0      1      0      0      0   yes
+duplicate [0,10) inserted twic      2      2      2      2      2   yes
+ contained [2,3) inside [0,10)      1      1      1      1      1   yes
+
+inverted [10,3) insert -> naive:rejected, sweep:rejected, tree:rejected
+
+Interpretation: 500 seeded queries per dataset over 3 datasets x 2 boundary
+  conventions = 3000 compared query results covering 2408 reported conflict
+  rows. disagreements found: 0 (expected 0).
+
+Interpretation: the convention is not decorative: touching intervals report 0
+  conflicts half-open and 1 inclusive, and a zero-length query reports 0 half-
+  open against 2 inclusive - identical numbers in either row would mean the
+  switch does nothing.
+
+Interpretation: the zero-length stored interval [5,5) draws counts [0, 0, 0]
+  across the three structures (identical means the empty-interval rule is
+  shared), duplicates come back as 2 rows everywhere, and every structure
+  rejects the inverted interval before it can corrupt an augmented max_end.
+==============================================================================
+4) insert / delete cost against table depth (timing)
+==============================================================================
+each pass inserts 150 extra intervals then deletes them again, so the
+table size is identical for every pass and no build time is subtracted;
+us/op counts both legs (insert + delete) as one round trip per item.
+     n tree h naive us/op sweep us/op  tree us/op      band n/s/t  tree desc
+----- ------ ----------- ----------- ----------- --------------- ----------
+   250     14        3.07       21.10        4.68     0.2/2.0/2.7        7.8
+   500     18        4.52       43.76        4.31     0.3/2.7/2.1        9.3
+  1000     24        9.53       86.21        4.46     5.0/8.7/0.7       10.7
+  2000     25       20.33      184.59        4.30    9.4/13.5/2.5       12.4
+  4000     27       38.28      394.67        5.42    9.3/17.4/4.0       13.8
+
+Interpretation: one write round trip costs the sweep 21.10 us per op at n=250
+  and 394.67 us at n=4000, i.e. 18.7x for a 16x larger table: both legs
+  rebuild the prefix-max array from the touched index to the tail, so a write
+  is Python-level O(n) no matter how the table was built.
+
+Interpretation: the tree moves 4.68 -> 5.42 us per op (1.16x) while its
+  measured height grows 14 -> 27 levels and its average insert descent 7.8 ->
+  13.8 comparisons. naive goes 3.07 -> 38.28 us: inserting is a bare append,
+  but the delete leg is list.remove, a full scan of the list, so the scan is
+  cheap to write into and expensive to write out of.
+
+Interpretation: each write difference is judged against the wider of its own
+  two bands at n=4000. naive versus tree: gap 32.86 us per op against bands of
+  9.26 (naive) and 4.02 (tree), so it is real (3.5x its floor). sweep versus
+  tree: gap 389.25 against bands of 17.39 and 4.02, so it is real (22.4x its
+  floor) - the sorted list is the expensive writer, even though the sweep is
+  already the cheaper reader at 1 of the 3 sizes in 1b.
+
+Interpretation: depth does not price the write: the tree's write price rose
+  1.16x while the insert descent it performs rose 1.77x (7.8 -> 13.8
+  comparisons), i.e. the cost grew by LESS than the number of comparisons
+  made, so searching is not what the 4.68 -> 5.42 us per op is mainly spent
+  on. this section cannot split allocation from searching; it only shows that
+  the descent alone does not explain the price, because a taller tree here
+  cost less per added comparison than the shallower one did.
+==============================================================================
+4b) does the tree degenerate on already-sorted input? (deterministic)
+==============================================================================
+      priorities  build order  height  nav/ins tail comps     shape
+--------------- ------------ ------- -------- ---------- ---------
+          random       sorted      24      8.2         11  balanced
+          random     shuffled      29     12.8          6  balanced
+ insertion order       sorted    2000    999.5       2000     chain
+ insertion order     shuffled      26     11.9         12  balanced
+
+Interpretation: randomized priorities on sorted input: height 24, tail query
+  tests 11 intervals. priorities = insertion order on the same sorted input: a
+  chain of height 2000 that tests all 2000 intervals for that query.
+
+Interpretation: the answer to 'does it degenerate' is: no, but only because of
+  the random priorities - nav/ins on sorted input is 8.2 comparisons with them
+  and 999.5 without, 121.9x apart in the write path alone.
+
+Interpretation: shuffled order with deterministic priorities is the honest
+  middle case (height 26, nav/ins 11.9, tail query 12 comparisons - still not
+  the 2000-deep chain): the collapse needs BOTH sorted input and non-
+  randomized priorities, which is exactly what happens when bookings arrive in
+  date order.
+
+Interpretation: the traversal is iterative, so the height-2000 chain was
+  walked without hitting Python's recursion limit; the query above really
+  returned 2000 comparisons, which is the cost of not balancing.
+==============================================================================
+5) bytes held per stored interval (deterministic)
+==============================================================================
+                  holder       KiB   bytes/iv   vs naive   vs fresh
+----------------------- --------- ---------- ---------- ----------
+        fresh tuple list    1419.8       72.7      1.00x      1.00x
+       shared tuple list     157.1        8.0      0.11x      0.11x
+              naive scan    1419.9       72.7      1.00x      1.00x
+            sorted sweep    3117.2      159.6      2.20x      2.20x
+           interval tree    3597.6      184.2      2.53x      2.53x
+
+Interpretation: method: tracemalloc delta across the build, n=20000, source
+  list created before the snapshot so its tuples are never charged to a
+  structure.
+
+Interpretation: the floor is 72.7 bytes per interval for a fresh list of
+  tuples; naive lands at 72.7 (1.00x the floor - it only adds list slack),
+  sweep 159.6 (2.20x) because it keeps a parallel sort-key tuple plus a
+  prefix-max array, and the tree 184.2 (2.53x) for two child pointers, a
+  parent pointer, a priority and the augmented max_end.
+
+Interpretation: reusing existing tuples instead of copying them would leave a
+  holder at 8.0 bytes per interval, so 64.7 of naive's 72.7 is the tuple
+  itself; the tree's overhead over naive at n=20000 is 2178 KiB for the whole
+  table.
+==============================================================================
+6) overlap density sweep at fixed table size (deterministic)
+==============================================================================
+the window width is scaled to a fraction of the axis, so k (returned
+conflicts) is what changes while the table stays at n=20000.
+  wanted   mean_k  naive/cq  sweep/cq  tree/cq   tree/k naive/tree
+------- -------- --------- --------- -------- -------- ----------
+  0.0005     10.6     20000        11       28     2.67     704.2x
+  0.0020     40.2     20000        40       58     1.44     344.8x
+  0.0100    197.8     20000       198      215     1.09      92.8x
+  0.0500    996.5     20000       996     1014     1.02      19.7x
+  0.2000   4002.6     20000      4003     4019     1.00       5.0x
+  0.5000  10016.5     20000     10017    10033     1.00       2.0x
+  1.0000  20000.0     20000     20000    20000     1.00       1.0x
+
+Interpretation: at wanted fraction 0.0005 the query returns 10.6 conflicts,
+  the tree tests 28 intervals and naive 20000: 704.2x fewer, and tree/k = 2.67
+  says how much of the tree's work is output rather than search.
+
+Interpretation: widening the window converges the three: at fraction 1.0 the
+  tree tests 20000 against naive's 20000 (1.0x) while returning 20000
+  conflicts - the output now dwarfs the search, so the structure stops paying.
+
+Interpretation: the strongest measured ratio across the sweep is 704.2x at
+  wanted fraction 0.0005 (naive 20000 tests against the tree's 28); the sweep
+  undercut even the tree there, 10.63 unrounded tests against the tree's 28.40
+  (2.7x fewer, both more precise than the table's integer column), so this
+  table must be read as probe counts, not as a ranking of structures.
+==============================================================================
+6b) the size at which the tree starts winning (timing)
+==============================================================================
+busy single-process calendar: occupancy 60%, window 120, n from 20
+up to 3000. the winner column names the cheapest structure only when
+its lead over the runner-up exceeds the wider of those two bands.
+     n q/pass naive us/q sweep us/q  tree us/q       band n/s/t        winner
+----- ------ ---------- ---------- ---------- ---------------- -------------
+    20   7500       4.47       2.08       2.61   0.86/0.18/0.32         sweep
+    50   3000       8.68       2.42       2.82   0.94/0.85/1.35  tie in noise
+   100   1500      17.61       2.23       2.71   2.14/1.57/1.20  tie in noise
+   200    750      32.07       2.55       2.90   3.81/0.26/1.36  tie in noise
+   500    300      81.36       3.13       3.87   4.14/2.99/0.28  tie in noise
+  1000    300     161.81       3.33       4.04  11.52/1.20/0.24  tie in noise
+  3000    300     506.78       3.79       4.98 139.79/3.68/0.20  tie in noise
+
+Interpretation: the scan is measurably slower than the tree, by more than the
+  wider of their two bands, at 7 of the 7 sizes probed (n=20, n=50, n=100,
+  n=200, n=500, n=1000, n=3000). the earliest is n=20, where the tree costs
+  2.61 us/query against naive's 4.47, a 1.86 us lead over a pair band of 0.86
+  us, and the tree is already ahead at the smallest table probed, so the flip
+  point for the plain loop sits below this range. 'a scan is fine while the
+  table is small' is therefore not what this run shows at any size at or above
+  n=20. the winner column compares the two cheapest structures against each
+  other, so it names sweep at n=20 and a tie at the rest, i.e. wherever a
+  verdict exists it is the sweep reading cheapest, never the tree and never
+  the scan.
+
+Interpretation: the two ratios are not the same claim: section 1 counted
+  4733.7x fewer interval tests for the tree at n=100000, while the measured
+  wall clock at n=3000 here is 101.8x (naive 506.78 us per query against tree
+  4.98 us). the gap between those two numbers is the per-query overhead every
+  structure pays - list build, result sort, call overhead - which no index can
+  remove.
+
+same structures, a window wide enough to return about half the table:
+       n   mean k  naive us/q   tree us/q   pair band  naive/tree
+------- -------- ----------- ----------- ----------- -----------
+    1000      517      330.23      361.39      163.03       0.91x
+    3000     1519     1050.78     1078.64      154.24       0.97x
+
+Interpretation: the sweep is the one to skip in production, and it is not
+  skipped for the reason the read table might suggest: at n=3000 it costs 3.79
+  us/query against the tree's 4.98 and naive's 506.78, so the two read within
+  1.19 us of each other, inside their 3.68 us pair band, yet every insert
+  rebuilds its prefix-max array to the tail, which section 4 measured at
+  394.67 us per op against the tree's 5.42 at n=4000 - 72.8x the write price
+  for a read difference of 1.19 us per query.
+
+Interpretation: the output wall of section 6 shows in wall clock too: these
+  queries return 517 and 1519 conflicts from n=1000 and n=3000 tables, and
+  once the answer is that big the per-row winner is at n=1000 neither (31.16
+  us apart against a band of 163.03) and at n=3000 neither (27.86 us apart
+  against a band of 154.24). the naive/tree ratios are 0.91x and 0.97x, i.e. 2
+  of the 2 rows give no verdict at all, so the index buys nothing that is
+  measurable once the answer is that big - building and sorting the answer
+  dominates the search, and no index removes that cost.
+==============================================================================
+end of run - all numbers above belong to this run only
+==============================================================================

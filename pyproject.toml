@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "interval-overlap-scheduler"
+version = "0.1.0"
+description = "Three dependency-free interval conflict-detection structures (naive scan, sorted sweep, augmented interval tree) behind one interface, with a benchmark that measures where each one actually pays"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[tool.setuptools]
+packages = ["intervallib"]
